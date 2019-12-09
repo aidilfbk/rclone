@@ -3,6 +3,7 @@
 package onedrive
 
 import (
+	"container/list"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -26,6 +27,7 @@ import (
 	"github.com/rclone/rclone/fs/encodings"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/oauthutil"
@@ -51,6 +53,7 @@ const (
 	driveTypeSharepoint         = "documentLibrary"
 	defaultChunkSize            = 10 * fs.MebiByte
 	chunkSizeMultiple           = 320 * fs.KibiByte
+	filesPerQuery               = 1000
 )
 
 // Globals
@@ -754,6 +757,130 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, iErr
 	}
 	return entries, nil
+}
+
+// ListR lists the objects and directories of the Fs starting
+// from dir recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+//
+// Don't implement this unless you have a more efficient way
+// of listing recursively that doing a directory traversal.
+func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
+	err = f.dirCache.FindRoot(ctx, false)
+	if err != nil {
+		return err
+	}
+
+	resolvedList := list.New()
+
+	list := walk.NewListRHelper(callback)
+
+	route := fmt.Sprintf("/root/delta?$select=id,name,eTag,cTag,createdBy,lastModifiedBy,createdDateTime,lastModifiedDateTime,size,parentReference,webUrl,description,folder,file,remoteItem,fileSystemInfo&$top=%d", filesPerQuery)
+
+	opts := rest.Opts{
+		Method:  "GET",
+		Path:    route,
+	}
+
+	unresolvedParentItems := make(map[string][]*api.Item)
+
+	for {
+		var result api.ViewDeltaResponse
+		var resp *http.Response
+		err = f.pacer.Call(func() (bool, error) {
+			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+			return shouldRetry(resp, err)
+		})
+
+		if err != nil {
+			return errors.Wrap(err, "couldn't list files")
+		}
+		if len(result.Value) == 0 {
+			break
+		}
+		for i := range result.Value {
+			item := &result.Value[i]
+			item.Name = enc.ToStandardName(item.GetName())
+
+			parentRef := item.GetParentReference()
+			parentPath, ok := f.dirCache.GetInv(fmt.Sprintf("%s#%s", parentRef.DriveID, parentRef.ID))
+			if !ok {
+				parentID := parentRef.ID
+				unresolvedParentItems[parentID] = append(unresolvedParentItems[parentID], item)
+				continue
+			}
+
+			remote := path.Join(dir, parentPath, item.GetName())
+			isFolder := item.GetFolder() != nil
+			if isFolder {
+				// cache the directory ID for later lookups
+				id := item.GetID()
+				f.dirCache.Put(remote, id)
+				d := fs.NewDir(remote, time.Time(item.GetLastModifiedDateTime())).SetID(id)
+				d.SetItems(item.GetFolder().ChildCount)
+
+				resolvedList.PushBack(d)
+			} else {
+				o, err := f.newObjectWithInfo(ctx, remote, item)
+				if err != nil {
+					return err
+				}
+				list.Add(o)
+			}
+
+			for resolvedList.Len() > 0 {
+				e := resolvedList.Front()
+				resolvedList.Remove(e)
+
+				d := e.Value.(*fs.Dir)
+
+				list.Add(d)
+
+				for _, item := range unresolvedParentItems[d.ID()] {
+					// TODO: clear unresolvedParentItems[d.ID()], not using slices because memory leaks
+					parentPath, ok := f.dirCache.GetInv(item.GetID())
+					if !ok {
+						return errors.New("failed assert")
+					}
+
+					remote := path.Join(dir, parentPath, item.GetName())
+					isFolder := item.GetFolder() != nil
+					if isFolder {
+						// cache the directory ID for later lookups
+						id := item.GetID()
+						f.dirCache.Put(remote, id)
+						d := fs.NewDir(remote, time.Time(item.GetLastModifiedDateTime())).SetID(id)
+						d.SetItems(item.GetFolder().ChildCount)
+
+						resolvedList.PushBack(d)
+					} else {
+						o, err := f.newObjectWithInfo(ctx, remote, item)
+						if err != nil {
+							return err
+						}
+						list.Add(o)
+					}
+				}
+			}
+		}
+		if result.NextLink == "" {
+			break
+		}
+		opts.Path = ""
+		opts.RootURL = result.NextLink
+	}
+
+	return nil
 }
 
 // Creates from the parameters passed in a half finished Object which
@@ -1750,6 +1877,7 @@ var (
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.PublicLinker    = (*Fs)(nil)
+	_ fs.ListRer         = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.MimeTyper       = &Object{}
 	_ fs.IDer            = &Object{}

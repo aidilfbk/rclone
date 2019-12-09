@@ -410,3 +410,13 @@ func (i *Item) GetParentReference() *ItemReference {
 func (i *Item) IsRemote() bool {
 	return i.RemoteItem != nil
 }
+
+// GetID returns a normalized ID of the item
+// If DriveID is known it will be prefixed to the ID with # seperator
+// Can be parsed using onedrive.parseNormalizedID(normalizedID)
+func (i *ItemReference) GetID() string {
+	if strings.Index(i.ID, "#") == -1 {
+		return i.DriveID + "#" + i.ID
+	}
+	return i.ID
+}
