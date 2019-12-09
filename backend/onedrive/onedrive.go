@@ -51,6 +51,7 @@ const (
 	driveTypeSharepoint         = "documentLibrary"
 	defaultChunkSize            = 10 * fs.MebiByte
 	chunkSizeMultiple           = 320 * fs.KibiByte
+	filesPerQuery               = 1000
 )
 
 // Globals
@@ -1168,6 +1169,152 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
+// ChangeNotify calls the passed function with a path that has had changes.
+// If the implementation uses polling, it should adhere to the given interval.
+//
+// Automatically restarts itself in case of unexpected behavior of the remote.
+//
+// Close the returned channel to stop being notified.
+func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	go func() {
+		// get the DeltaLink early so all changes from now on get processed
+		startDeltaLink, err := f.changeNotifyStartDeltaLink(ctx)
+		if err != nil {
+			fs.Infof(f, "Failed to get StartDeltaLink: %s", err)
+		}
+		var ticker *time.Ticker
+		var tickerC <-chan time.Time
+		for {
+			select {
+			case pollInterval, ok := <-pollIntervalChan:
+				if !ok {
+					if ticker != nil {
+						ticker.Stop()
+					}
+					return
+				}
+				if ticker != nil {
+					ticker.Stop()
+					ticker, tickerC = nil, nil
+				}
+				if pollInterval != 0 {
+					ticker = time.NewTicker(pollInterval)
+					tickerC = ticker.C
+				}
+			case <-tickerC:
+				if startDeltaLink == "" {
+					startDeltaLink, err = f.changeNotifyStartDeltaLink(ctx)
+					if err != nil {
+						fs.Infof(f, "Failed to get StartDeltaLink: %s", err)
+						continue
+					}
+				}
+				fs.Debugf(f, "Checking for changes on remote")
+				startDeltaLink, err = f.changeNotifyRunner(ctx, notifyFunc, startDeltaLink)
+				if err != nil {
+					fs.Infof(f, "Change notify listener failure: %s", err)
+				}
+			}
+		}
+	}()
+}
+
+func (f *Fs) changeNotifyStartDeltaLink(ctx context.Context) (pageToken string, err error) {
+	opts := rest.Opts{
+		Method:  "GET",
+		Path:    fmt.Sprintf("/root/delta?$top=%d&$select=id,name,parentReference,file,folder&token=latest", filesPerQuery),
+	}
+
+	var result api.ViewDeltaResponse
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+		return shouldRetry(resp, err)
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return result.DeltaLink, nil
+}
+
+func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType), deltaLink string) (newDeltaLink string, err error) {
+	pageLink := deltaLink
+
+	for {
+		opts := rest.Opts{
+			Method:  "GET",
+			RootURL: pageLink,
+		}
+
+		var result api.ViewDeltaResponse
+		var resp *http.Response
+		err = f.pacer.Call(func() (bool, error) {
+			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+			return shouldRetry(resp, err)
+		})
+
+		if err != nil {
+			return
+		}
+
+		type entryType struct {
+			path      string
+			entryType fs.EntryType
+		}
+		var pathsToClear []entryType
+		for i := range result.Value {
+			item := &result.Value[i]
+			isFile := item.GetFile() != nil
+
+			// find the previous path
+			if path, ok := f.dirCache.GetInv(item.GetID()); ok {
+				if isFile {
+					pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
+				} else {
+					pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryDirectory})
+				}
+			}
+
+			// find the new path
+			if isFile {
+				// translate the parent dir of this object
+				isChild := item.GetParentReference().ID != ""
+				if isChild {
+					if parentPath, ok := f.dirCache.GetInv(item.GetParentReference().GetID()); ok {
+						// and append the drive file name to compute the full file name
+						path := path.Join(parentPath, enc.ToStandardName(item.GetName()))
+						// this will now clear the actual file too
+						pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
+					}
+				} else { // a true root object that is changed
+					// TODO: check if hardcoded path is always correct
+					pathsToClear = append(pathsToClear, entryType{path: "", entryType: fs.EntryObject})
+				}
+			}
+		}
+
+		visitedPaths := make(map[string]struct{})
+		for _, entry := range pathsToClear {
+			if _, ok := visitedPaths[entry.path]; ok {
+				continue
+			}
+			visitedPaths[entry.path] = struct{}{}
+			notifyFunc(entry.path, entry.entryType)
+		}
+
+		switch {
+		case result.DeltaLink != "":
+			return result.DeltaLink, nil
+		case result.NextLink != "":
+			pageLink = result.NextLink
+		default:
+			return
+		}
+	}
+}
+
 // DirCacheFlush resets the directory cache - used in testing as an
 // optional interface
 func (f *Fs) DirCacheFlush() {
@@ -1749,6 +1896,7 @@ var (
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
+	_ fs.ChangeNotifier  = (*Fs)(nil)
 	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.MimeTyper       = &Object{}
